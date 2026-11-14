@@ -32,6 +32,23 @@
       "icons/icon.png",
       "icons/icon.ico",
       "icons/icon.icns"
-    ]
+    ],
+    "macOS": {
+      "signingIdentity": "-",
+      "minimumSystemVersion": "10.15"
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": [
+          "Russian",
+          "English"
+        ],
+        "displayLanguageSelector": true
+      }
+    }
   }
 }

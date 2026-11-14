@@ -51,6 +51,84 @@ jobs:
         working-directory: src-tauri
         run: cargo test
 
+      - name: Import Apple Developer certificate & notarization key (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE_B64: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD_RAW: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY_RAW: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID_RAW: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY_RAW: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER_RAW: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_CONTENT_RAW: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          if [ -z "$APPLE_CERTIFICATE_B64" ] || [ -z "$APPLE_CERTIFICATE_PASSWORD_RAW" ]; then
+            echo "Apple Developer certificate secrets are not configured; falling back to ad-hoc macOS signing."
+            exit 0
+          fi
+
+          KEYCHAIN_PATH="$RUNNER_TEMP/comandos-ci-signing.keychain-db"
+          KEYCHAIN_PWD="$(uuidgen)"
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          WWDR_PATH="$RUNNER_TEMP/DeveloperIDG2CA.cer"
+
+          printf '%s' "$APPLE_CERTIFICATE_B64" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security set-key-settings -lut 21600 "$KEYCHAIN_PATH" 2>/dev/null || security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+
+          EXISTING_KEYCHAINS=()
+          while IFS= read -r line; do
+            trimmed="$(printf '%s' "$line" | sed -E 's/^[[:space:]]*"?//; s/"?[[:space:]]*$//')"
+            [ -n "$trimmed" ] && EXISTING_KEYCHAINS+=("$trimmed")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$KEYCHAIN_PATH" ${EXISTING_KEYCHAINS[@]+"${EXISTING_KEYCHAINS[@]}"}
+          security default-keychain -s "$KEYCHAIN_PATH"
+
+          if curl -fsSL "https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer" -o "$WWDR_PATH"; then
+            security import "$WWDR_PATH" -k "$KEYCHAIN_PATH" -A >/dev/null 2>&1 || true
+          fi
+
+          security import "$CERT_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD_RAW" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security >/dev/null
+
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH" >/dev/null
+          rm -f "$CERT_PATH" "$WWDR_PATH"
+
+          DETECTED_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk -F'"' '/Developer ID Application:/ { print $2; exit }')"
+          SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY_RAW:-$DETECTED_IDENTITY}"
+          if [ -z "$SIGNING_IDENTITY" ]; then
+            echo "ERROR: No valid 'Developer ID Application' identity found after importing APPLE_CERTIFICATE." >&2
+            exit 1
+          fi
+          echo "APPLE_SIGNING_IDENTITY=$SIGNING_IDENTITY" >> "$GITHUB_ENV"
+          echo "Configured macOS codesign identity: $SIGNING_IDENTITY"
+
+          if [ -n "$APPLE_API_KEY_CONTENT_RAW" ] && [ -n "$APPLE_API_KEY_RAW" ] && [ -n "$APPLE_API_ISSUER_RAW" ] && [ -n "$APPLE_TEAM_ID_RAW" ]; then
+            API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_RAW}.p8"
+            printf '%s\n' "$APPLE_API_KEY_CONTENT_RAW" > "$API_KEY_PATH"
+            chmod 600 "$API_KEY_PATH"
+            {
+              echo "APPLE_TEAM_ID=$APPLE_TEAM_ID_RAW"
+              echo "APPLE_API_KEY=$APPLE_API_KEY_RAW"
+              echo "APPLE_API_ISSUER=$APPLE_API_ISSUER_RAW"
+              echo "APPLE_API_KEY_PATH=$API_KEY_PATH"
+            } >> "$GITHUB_ENV"
+            echo "Configured Apple notarization credentials (Team: $APPLE_TEAM_ID_RAW, Key: $APPLE_API_KEY_RAW)."
+          else
+            echo "WARNING: Apple notarization API key secrets are incomplete; build will be signed without notarization."
+          fi
+
       - name: Build Tauri bundle and publish GitHub Release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -63,12 +141,41 @@ jobs:
 
             | Платформа | Файл установщика | Описание |
             |-----------|------------------|----------|
-            | **macOS** (Apple Silicon + Intel) | `COMANDOS.Claude.Cleaner___VERSION___universal.dmg` | Универсальный образ `.dmg` для M1–M4 и Intel |
+            | **macOS** (Apple Silicon + Intel) | `COMANDOS.Claude.Cleaner___VERSION___universal.dmg` | Универсальный образ `.dmg` для M1–M4 и Intel (подписан и нотаризован Apple Developer ID) |
             | **Windows 10/11** (x64) | `COMANDOS.Claude.Cleaner___VERSION___x64-setup.exe` | Установщик NSIS (`.exe`) |
             | **Windows 10/11** (MSI) | `COMANDOS.Claude.Cleaner___VERSION___x64_en-US.msi` | Пакет Windows Installer (`.msi`) |
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+
+      - name: Sign, notarize, and staple macOS .dmg and update GitHub Release
+        if: runner.os == 'macOS'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ] || [ -z "${APPLE_API_KEY_PATH:-}" ]; then
+            echo "Skipping outer .dmg notarization (no Apple credentials)."
+            exit 0
+          fi
+          for dmg in src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg; do
+            echo "Signing outer DMG: $dmg"
+            codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$dmg"
+            echo "Submitting outer DMG for Apple notarization: $dmg"
+            xcrun notarytool submit "$dmg" \
+              --key "$APPLE_API_KEY_PATH" \
+              --key-id "$APPLE_API_KEY" \
+              --issuer "$APPLE_API_ISSUER" \
+              --wait
+            echo "Stapling notarization ticket to DMG: $dmg"
+            xcrun stapler staple "$dmg"
+            xcrun stapler validate "$dmg"
+            if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+              TAG_NAME="${GITHUB_REF#refs/tags/}"
+              echo "Uploading notarized & stapled DMG to release $TAG_NAME..."
+              gh release upload "$TAG_NAME" "$dmg" --clobber
+            fi
+          done
 
       - name: Upload installer artifacts
         uses: actions/upload-artifact@v4
@@ -76,3 +183,11 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.bundle_glob }}
           if-no-files-found: warn
+
+      - name: Cleanup temporary signing credentials (macOS)
+        if: always() && runner.os == 'macOS'
+        run: |
+          rm -f "$RUNNER_TEMP/certificate.p12" "$RUNNER_TEMP/DeveloperIDG2CA.cer" "$RUNNER_TEMP"/AuthKey_*.p8
+          if [ -f "$RUNNER_TEMP/comandos-ci-signing.keychain-db" ]; then
+            security delete-keychain "$RUNNER_TEMP/comandos-ci-signing.keychain-db" >/dev/null 2>&1 || true
+          fi
