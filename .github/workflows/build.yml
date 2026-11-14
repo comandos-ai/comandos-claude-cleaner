@@ -78,7 +78,7 @@ jobs:
           printf '%s' "$APPLE_CERTIFICATE_B64" | base64 --decode > "$CERT_PATH"
 
           security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
-          security set-key-settings -lut 21600 "$KEYCHAIN_PATH" 2>/dev/null || security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
 
           EXISTING_KEYCHAINS=()
@@ -120,9 +120,9 @@ jobs:
             chmod 600 "$API_KEY_PATH"
             {
               echo "APPLE_TEAM_ID=$APPLE_TEAM_ID_RAW"
-              echo "APPLE_API_KEY=$APPLE_API_KEY_RAW"
-              echo "APPLE_API_ISSUER=$APPLE_API_ISSUER_RAW"
-              echo "APPLE_API_KEY_PATH=$API_KEY_PATH"
+              echo "NOTARY_KEY_ID=$APPLE_API_KEY_RAW"
+              echo "NOTARY_ISSUER_ID=$APPLE_API_ISSUER_RAW"
+              echo "NOTARY_KEY_PATH=$API_KEY_PATH"
             } >> "$GITHUB_ENV"
             echo "Configured Apple notarization credentials (Team: $APPLE_TEAM_ID_RAW, Key: $APPLE_API_KEY_RAW)."
           else
@@ -141,38 +141,47 @@ jobs:
 
             | Платформа | Файл установщика | Описание |
             |-----------|------------------|----------|
-            | **macOS** (Apple Silicon + Intel) | `COMANDOS.Claude.Cleaner___VERSION___universal.dmg` | Универсальный образ `.dmg` для M1–M4 и Intel (подписан и нотаризован Apple Developer ID) |
+            | **macOS** (Apple Silicon + Intel) | `COMANDOS.Claude.Cleaner___VERSION___universal.dmg` | Универсальный образ `.dmg` для M1–M4 и Intel (подписан Apple Developer ID) |
             | **Windows 10/11** (x64) | `COMANDOS.Claude.Cleaner___VERSION___x64-setup.exe` | Установщик NSIS (`.exe`) |
             | **Windows 10/11** (MSI) | `COMANDOS.Claude.Cleaner___VERSION___x64_en-US.msi` | Пакет Windows Installer (`.msi`) |
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
 
-      - name: Sign, notarize, and staple macOS .dmg and update GitHub Release
+      - name: Sign, notarize (if agreement active), and update macOS .dmg in GitHub Release
         if: runner.os == 'macOS'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ] || [ -z "${APPLE_API_KEY_PATH:-}" ]; then
-            echo "Skipping outer .dmg notarization (no Apple credentials)."
+          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            echo "Skipping outer .dmg signing (no Apple signing identity)."
             exit 0
           fi
+          APP_BUNDLE="src-tauri/target/universal-apple-darwin/release/bundle/macos/COMANDOS Claude Cleaner.app"
+          if [ -d "$APP_BUNDLE" ]; then
+            codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+          fi
           for dmg in src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg; do
-            echo "Signing outer DMG: $dmg"
+            echo "Signing outer DMG with Developer ID: $dmg"
             codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$dmg"
-            echo "Submitting outer DMG for Apple notarization: $dmg"
-            xcrun notarytool submit "$dmg" \
-              --key "$APPLE_API_KEY_PATH" \
-              --key-id "$APPLE_API_KEY" \
-              --issuer "$APPLE_API_ISSUER" \
-              --wait
-            echo "Stapling notarization ticket to DMG: $dmg"
-            xcrun stapler staple "$dmg"
-            xcrun stapler validate "$dmg"
+            if [ -n "${NOTARY_KEY_PATH:-}" ] && [ -n "${NOTARY_KEY_ID:-}" ] && [ -n "${NOTARY_ISSUER_ID:-}" ]; then
+              echo "Submitting DMG for Apple notarization: $dmg"
+              if xcrun notarytool submit "$dmg" \
+                --key "$NOTARY_KEY_PATH" \
+                --key-id "$NOTARY_KEY_ID" \
+                --issuer "$NOTARY_ISSUER_ID" \
+                --wait; then
+                echo "Stapling notarization ticket to DMG: $dmg"
+                xcrun stapler staple "$dmg"
+                xcrun stapler validate "$dmg"
+              else
+                echo "::warning::Apple notarytool returned an error (check if an updated Apple Developer Agreement needs acceptance at developer.apple.com/account). Proceeding with Developer ID signed DMG."
+              fi
+            fi
             if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
               TAG_NAME="${GITHUB_REF#refs/tags/}"
-              echo "Uploading notarized & stapled DMG to release $TAG_NAME..."
+              echo "Uploading Developer ID signed DMG to release $TAG_NAME..."
               gh release upload "$TAG_NAME" "$dmg" --clobber
             fi
           done
